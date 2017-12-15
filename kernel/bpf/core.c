@@ -64,11 +64,13 @@ void *bpf_internal_load_pointer_neg_helper(const struct sk_buff *skb, int k, uns
 {
 	u8 *ptr = NULL;
 
-	if (k >= SKF_NET_OFF)
+	if (k >= SKF_NET_OFF) {
 		ptr = skb_network_header(skb) + k - SKF_NET_OFF;
-	else if (k >= SKF_LL_OFF)
+	} else if (k >= SKF_LL_OFF) {
+		if (unlikely(!skb_mac_header_was_set(skb)))
+			return NULL;
 		ptr = skb_mac_header(skb) + k - SKF_LL_OFF;
-
+	}
 	if (ptr >= skb->head && ptr + size <= skb_tail_pointer(skb))
 		return ptr;
 
@@ -218,37 +220,63 @@ int bpf_prog_calc_tag(struct bpf_prog *fp)
 	return 0;
 }
 
-static bool bpf_is_jmp_and_has_target(const struct bpf_insn *insn)
+static int bpf_adj_branches(struct bpf_prog *prog, u32 pos, u32 delta,
+			    const bool probe_pass)
 {
-	return BPF_CLASS(insn->code) == BPF_JMP  &&
-	       /* Call and Exit are both special jumps with no
-		* target inside the BPF instruction image.
-		*/
-	       BPF_OP(insn->code) != BPF_CALL &&
-	       BPF_OP(insn->code) != BPF_EXIT;
-}
-
-static void bpf_adj_branches(struct bpf_prog *prog, u32 pos, u32 delta)
-{
+	u32 i, insn_cnt = prog->len + (probe_pass ? delta : 0);
 	struct bpf_insn *insn = prog->insnsi;
-	u32 i, insn_cnt = prog->len;
+	int ret = 0;
+	bool pseudo_call;
+	u8 code;
+	int off;
 
 	for (i = 0; i < insn_cnt; i++, insn++) {
-		if (!bpf_is_jmp_and_has_target(insn))
-			continue;
+		/* In the probing pass we still operate on the original,
+		 * unpatched image in order to check overflows before we
+		 * do any other adjustments. Therefore skip the patchlet.
+		 */
+		if (probe_pass && i == pos) {
+			i += delta + 1;
+			insn++;
+		}
 
-		/* Adjust offset of jmps if we cross boundaries. */
-		if (i < pos && i + insn->off + 1 > pos)
-			insn->off += delta;
-		else if (i > pos + delta && i + insn->off + 1 <= pos + delta)
-			insn->off -= delta;
+		code = insn->code;
+		if (BPF_CLASS(code) != BPF_JMP)
+			continue;
+		if (BPF_OP(code) == BPF_EXIT)
+			continue;
+		if (BPF_OP(code) == BPF_CALL) {
+			if (insn->src_reg == BPF_PSEUDO_CALL)
+				pseudo_call = true;
+			else
+				continue;
+		} else {
+			pseudo_call = false;
+		}
+		off = pseudo_call ? insn->imm : insn->off;
+
+		/* Adjust offset of jmps if we cross patch boundaries. */
+		if (i < pos && i + off + 1 > pos)
+			off += delta;
+		else if (i > pos + delta && i + off + 1 <= pos + delta)
+			off -= delta;
+		if (pseudo_call)
+			insn->imm = off;
+		else
+			insn->off = off;
+
+		if (ret)
+			break;
 	}
+
+	return ret;
 }
 
 struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
 				       const struct bpf_insn *patch, u32 len)
 {
 	u32 insn_adj_cnt, insn_rest, insn_delta = len - 1;
+	const u32 cnt_max = S16_MAX;
 	struct bpf_prog *prog_adj;
 
 	/* Since our patchlet doesn't expand the image, we're done. */
@@ -258,6 +286,15 @@ struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
 	}
 
 	insn_adj_cnt = prog->len + insn_delta;
+
+	/* Reject anything that would potentially let the insn->off
+	 * target overflow when we have excessive program expansions.
+	 * We need to probe here before we do any reallocation where
+	 * we afterwards may not fail anymore.
+	 */
+	if (insn_adj_cnt > cnt_max &&
+	    bpf_adj_branches(prog, off, insn_delta, true))
+		return NULL;
 
 	/* Several new instructions need to be inserted. Make room
 	 * for them. Likely, there's no need for a new allocation as
@@ -284,7 +321,11 @@ struct bpf_prog *bpf_patch_insn_single(struct bpf_prog *prog, u32 off,
 		sizeof(*patch) * insn_rest);
 	memcpy(prog_adj->insnsi + off, patch, sizeof(*patch) * len);
 
-	bpf_adj_branches(prog_adj, off, insn_delta);
+	/* We are guaranteed to not fail at this point, otherwise
+	 * the ship has sailed to reverse to the original state. An
+	 * overflow cannot happen at this point.
+	 */
+	BUG_ON(bpf_adj_branches(prog_adj, off, insn_delta, false));
 
 	return prog_adj;
 }
@@ -295,6 +336,7 @@ int bpf_jit_enable   __read_mostly = IS_BUILTIN(CONFIG_BPF_JIT_ALWAYS_ON);
 int bpf_jit_harden   __read_mostly;
 int bpf_jit_kallsyms __read_mostly;
 long bpf_jit_limit   __read_mostly;
+long bpf_jit_limit_max __read_mostly;
 
 static __always_inline void
 bpf_get_prog_addr_region(const struct bpf_prog *prog,
@@ -508,7 +550,8 @@ u64 __weak bpf_jit_alloc_exec_limit(void)
 static int __init bpf_jit_charge_init(void)
 {
 	/* Only used as heuristic here to derive limit. */
-	bpf_jit_limit = min_t(u64, round_up(bpf_jit_alloc_exec_limit() >> 2,
+	bpf_jit_limit_max = bpf_jit_alloc_exec_limit();
+	bpf_jit_limit = min_t(u64, round_up(bpf_jit_limit_max >> 1,
 					    PAGE_SIZE), LONG_MAX);
 	return 0;
 }
@@ -643,9 +686,6 @@ static int bpf_jit_blind_insn(const struct bpf_insn *from,
 	 * below.
 	 *
 	 * Constant blinding is only used by JITs, not in the interpreter.
-	 * The interpreter uses AX in some occasions as a local temporary
-	 * register e.g. in DIV or MOD instructions.
-	 *
 	 * In restricted circumstances, the verifier can also use the AX
 	 * register for rewrites as long as they do not interfere with
 	 * the above cases!
@@ -863,8 +903,7 @@ EXPORT_SYMBOL_GPL(__bpf_call_base);
  *
  * Decode and execute eBPF instructions.
  */
-static unsigned int ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn,
-				    u64 *stack)
+static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 *stack)
 {
 	u64 tmp;
 	static const void *jumptable[256] = {
@@ -924,6 +963,7 @@ static unsigned int ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn,
 		[BPF_ALU64 | BPF_NEG] = &&ALU64_NEG,
 		/* Call instruction */
 		[BPF_JMP | BPF_CALL] = &&JMP_CALL,
+		[BPF_JMP | BPF_CALL_ARGS] = &&JMP_CALL_ARGS,
 		[BPF_JMP | BPF_TAIL_CALL] = &&JMP_TAIL_CALL,
 		/* Jumps */
 		[BPF_JMP | BPF_JA] = &&JMP_JA,
@@ -1038,44 +1078,36 @@ select_insn:
 		(*(s64 *) &DST) >>= IMM;
 		CONT;
 	ALU64_MOD_X:
-		if (unlikely(SRC == 0))
-			return 0;
-		div64_u64_rem(DST, SRC, &AX);
-		DST = AX;
+		div64_u64_rem(DST, SRC, &tmp);
+		DST = tmp;
 		CONT;
 	ALU_MOD_X:
-		if (unlikely((u32)SRC == 0))
-			return 0;
-		AX = (u32) DST;
-		DST = do_div(AX, (u32) SRC);
+		tmp = (u32) DST;
+		DST = do_div(tmp, (u32) SRC);
 		CONT;
 	ALU64_MOD_K:
-		div64_u64_rem(DST, IMM, &AX);
-		DST = AX;
+		div64_u64_rem(DST, IMM, &tmp);
+		DST = tmp;
 		CONT;
 	ALU_MOD_K:
-		AX = (u32) DST;
-		DST = do_div(AX, (u32) IMM);
+		tmp = (u32) DST;
+		DST = do_div(tmp, (u32) IMM);
 		CONT;
 	ALU64_DIV_X:
-		if (unlikely(SRC == 0))
-			return 0;
 		DST = div64_u64(DST, SRC);
 		CONT;
 	ALU_DIV_X:
-		if (unlikely((u32)SRC == 0))
-			return 0;
-		AX = (u32) DST;
-		do_div(AX, (u32) SRC);
-		DST = (u32) AX;
+		tmp = (u32) DST;
+		do_div(tmp, (u32) SRC);
+		DST = (u32) tmp;
 		CONT;
 	ALU64_DIV_K:
 		DST = div64_u64(DST, IMM);
 		CONT;
 	ALU_DIV_K:
-		AX = (u32) DST;
-		do_div(AX, (u32) IMM);
-		DST = (u32) AX;
+		tmp = (u32) DST;
+		do_div(tmp, (u32) IMM);
+		DST = (u32) tmp;
 		CONT;
 	ALU_END_TO_BE:
 		switch (IMM) {
@@ -1112,6 +1144,13 @@ select_insn:
 		 */
 		BPF_R0 = (__bpf_call_base + insn->imm)(BPF_R1, BPF_R2, BPF_R3,
 						       BPF_R4, BPF_R5);
+		CONT;
+
+	JMP_CALL_ARGS:
+		BPF_R0 = (__bpf_call_base_args + insn->imm)(BPF_R1, BPF_R2,
+							    BPF_R3, BPF_R4,
+							    BPF_R5,
+							    insn + insn->off + 1);
 		CONT;
 
 	JMP_TAIL_CALL: {
@@ -1386,6 +1425,23 @@ static unsigned int PROG_NAME(stack_size)(const void *ctx, const struct bpf_insn
 	return ___bpf_prog_run(regs, insn, stack); \
 }
 
+#define PROG_NAME_ARGS(stack_size) __bpf_prog_run_args##stack_size
+#define DEFINE_BPF_PROG_RUN_ARGS(stack_size) \
+static u64 PROG_NAME_ARGS(stack_size)(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5, \
+				      const struct bpf_insn *insn) \
+{ \
+	u64 stack[stack_size / sizeof(u64)]; \
+	u64 regs[MAX_BPF_REG]; \
+\
+	FP = (u64) (unsigned long) &stack[ARRAY_SIZE(stack)]; \
+	BPF_R1 = r1; \
+	BPF_R2 = r2; \
+	BPF_R3 = r3; \
+	BPF_R4 = r4; \
+	BPF_R5 = r5; \
+	return ___bpf_prog_run(regs, insn, stack); \
+}
+
 #define EVAL1(FN, X) FN(X)
 #define EVAL2(FN, X, Y...) FN(X) EVAL1(FN, Y)
 #define EVAL3(FN, X, Y...) FN(X) EVAL2(FN, Y)
@@ -1397,6 +1453,10 @@ EVAL6(DEFINE_BPF_PROG_RUN, 32, 64, 96, 128, 160, 192);
 EVAL6(DEFINE_BPF_PROG_RUN, 224, 256, 288, 320, 352, 384);
 EVAL4(DEFINE_BPF_PROG_RUN, 416, 448, 480, 512);
 
+EVAL6(DEFINE_BPF_PROG_RUN_ARGS, 32, 64, 96, 128, 160, 192);
+EVAL6(DEFINE_BPF_PROG_RUN_ARGS, 224, 256, 288, 320, 352, 384);
+EVAL4(DEFINE_BPF_PROG_RUN_ARGS, 416, 448, 480, 512);
+
 #define PROG_NAME_LIST(stack_size) PROG_NAME(stack_size),
 
 static unsigned int (*interpreters[])(const void *ctx,
@@ -1404,6 +1464,25 @@ static unsigned int (*interpreters[])(const void *ctx,
 EVAL6(PROG_NAME_LIST, 32, 64, 96, 128, 160, 192)
 EVAL6(PROG_NAME_LIST, 224, 256, 288, 320, 352, 384)
 EVAL4(PROG_NAME_LIST, 416, 448, 480, 512)
+
+#undef PROG_NAME_LIST
+#define PROG_NAME_LIST(stack_size) PROG_NAME_ARGS(stack_size),
+static u64 (*interpreters_args[])(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5,
+				  const struct bpf_insn *insn) = {
+EVAL6(PROG_NAME_LIST, 32, 64, 96, 128, 160, 192)
+EVAL6(PROG_NAME_LIST, 224, 256, 288, 320, 352, 384)
+EVAL4(PROG_NAME_LIST, 416, 448, 480, 512)
+};
+#undef PROG_NAME_LIST
+void bpf_patch_call_args(struct bpf_insn *insn, u32 stack_depth)
+{
+	stack_depth = max_t(u32, stack_depth, 1);
+	insn->off = (s16) insn->imm;
+	insn->imm = interpreters_args[(round_up(stack_depth, 32) / 32) - 1] -
+		__bpf_call_base_args;
+	insn->code = BPF_JMP | BPF_CALL_ARGS;
+}
+
 };
 
 #else
@@ -1764,6 +1843,7 @@ const struct bpf_func_proto bpf_get_prandom_u32_proto __weak;
 const struct bpf_func_proto bpf_get_smp_processor_id_proto __weak;
 const struct bpf_func_proto bpf_get_numa_node_id_proto __weak;
 const struct bpf_func_proto bpf_ktime_get_ns_proto __weak;
+const struct bpf_func_proto bpf_ktime_get_boot_ns_proto __weak;
 
 const struct bpf_func_proto bpf_get_current_pid_tgid_proto __weak;
 const struct bpf_func_proto bpf_get_current_uid_gid_proto __weak;
