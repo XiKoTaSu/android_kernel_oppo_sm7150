@@ -635,6 +635,26 @@ static struct file_system_type bpf_fs_type = {
 	.kill_sb	= kill_litter_super,
 };
 
+int vfs_mkobj(struct dentry *dentry, umode_t mode,
+              int (*f)(struct dentry *, umode_t, void *),
+              void *arg)
+{
+	struct inode *inode = new_inode(dentry->d_parent->i_sb);
+	if (!inode)
+		return -ENOMEM;
+	inode->i_ino = get_next_ino();
+	inode->i_mode = mode;
+	inode->i_uid = current_fsuid();
+	inode->i_gid = current_fsgid();
+	inode->i_atime = inode->i_mtime = inode->i_ctime = current_time(inode);
+	inode->i_private = arg;
+	if (f)
+		return f(dentry, mode, arg);
+	d_instantiate(dentry, inode);
+	return 0;
+}
+EXPORT_SYMBOL(vfs_mkobj);
+
 static int __init bpf_init(void)
 {
 	int ret;

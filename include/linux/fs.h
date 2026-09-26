@@ -209,6 +209,11 @@ typedef int (dio_iodone_t)(struct kiocb *iocb, loff_t offset,
  *
  * Derek Atkins <warlord@MIT.EDU> 94-10-20
  */
+ 
+int vfs_mkobj(struct dentry *, umode_t,
+              int (*f)(struct dentry *, umode_t, void *),
+              void *);
+
 struct iattr {
 	unsigned int	ia_valid;
 	umode_t		ia_mode;
